@@ -1,0 +1,482 @@
+---
+title: "BDA 2021 Project. Which hour is the post to post on HackerNews?"
+output: 
+  pdf_document:
+    toc: true
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(cache = TRUE)
+```
+
+# Introduction
+
+HackerNews (http://news.ycombinator.com) is a popular technical news board where people share links on various resources. Each post has a score that accumulates accorging to user upvotes and downvotes. Recent posts with high scores get a high ranking on the news board. Then, post rank gradually degrades with time. The actual scoring algorithm can be explored  [here](https://github.com/wting/hackernews/blob/5a3296417d23d1ecc901447af63dfc27af217f40/news.arc#L270).
+
+Goals of this project are:
+
+1. Try to identify which is the **best hour to post** in HN using Bayesian methods
+2. Explore different methods that allow to fit and evaluate Stan models on large datasets
+
+```{r message=FALSE, warning=FALSE}
+library(fs)
+library(tidyverse)
+library(jsonlite)
+library(lubridate)
+library(rstan)
+library(cmdstanr)
+library(bayesplot)
+library(loo)
+library(posterior)
+library(glue)
+
+SEED = 42
+set.seed(SEED)
+```
+
+# Data loading
+Let's load the historical HN post data from [this repository](https://github.com/massanishi/hackernews-post-datasets). The data is stored in JSONL format, where each line in a file contains JSON object that represents a single post. 
+
+First, we load all JSONL file contents into strings:
+
+```{r message=FALSE, warning=FALSE, cache=TRUE}
+json_data <- dir_ls('./hackernews-post-datasets', glob = "*.json") %>% 
+  map_dfr(~ paste(readLines(.), collapse = ""))
+```
+
+Then, we parse the JSONL strings using the `jsonlite` package and combine all records into a single tibble:
+```{r cache=TRUE}
+hn_posts <- as_tibble(
+  json_data %>% map_dfr(fromJSON, flatten=TRUE)
+  ) %>% 
+  drop_na(score) %>%
+  mutate(
+    time = as_datetime(time),
+    hour = hour(time) + 1,
+    weekday = as.factor(weekdays(time)),
+    year = year(time)
+  )
+```
+
+# Exploratory Data Analysis
+Now, we will explore the dataset. The primary things we are interested for this task are score distributions for each hour and weekday.
+
+The dataset contains only posts and no comments, so we don't need to filter it by type.
+```{r}
+hn_posts %>% select(type) %>% unique
+```
+Let's see the total number of data points:
+```{r}
+hn_posts %>% count
+```
+This number is significant and we will likely have problems using HMC sampler on this scale.
+
+Score summary statistics:
+```{r}
+summary(hn_posts$score)
+```
+
+We have several years worth of data:
+```{r}
+hn_posts %>% 
+  mutate(year = year(time)) %>% 
+  group_by(year) %>% 
+  count()
+```
+
+```{r}
+ggplot(hn_posts) + 
+  geom_histogram(aes(score), fill='slateblue') + 
+  ggtitle("Score histogram for all posts") +
+  theme_minimal()
+```
+
+Now, let's look at how score is distributed hourly
+```{r}
+library(ggridges)
+score_rigdeplot <- function (df, col, title="Score distribution for each hour", ylab="Hour") {
+  qcol <- enquo(col)
+  ggplot(df, aes(x = score, y = as.factor(!!qcol))) +
+    stat_density_ridges(alpha = 0.6, 
+                          rel_min_height = 0.01, 
+                          scale = 25, 
+                          calc_ecdf = TRUE, 
+                          quantiles = c(0.025, 0.975), 
+                          quantile_lines = TRUE) + 
+    xlim(0, 500) +
+    ylab(ylab) +
+    ggtitle(title) +
+    theme_minimal()
+}
+
+hn_posts %>%
+  score_rigdeplot(., hour)
+```
+
+Now, let's do the same plot for weekdays:
+```{r}
+hn_posts %>%
+  score_rigdeplot(., weekday, title="Score distribution for each weekday", ylab="Weekday")
+```
+We see that distribution changes significantly from day to day.
+
+The score distribution looks like Possion. In Possion distribution, sample mean $\hat{\mu}$ is equal to sample std $\hat{\sigma}$. Let's check that:
+
+```{r}
+hn_posts %>%
+  drop_na(score) %>%
+  group_by(hour) %>%
+  summarise(mean = mean(score), sd = sd(score)) %>%
+  mutate(diff = mean - sd) %>%
+  arrange(desc(diff))
+```
+
+Seems like all hourly distributions are overdispersed. This suggests that we should use Negative-Binomial distribution instead of Poisson, as it has heavier tails.
+
+Let's confirm the same for the weekdays:
+```{r}
+hn_posts %>%
+  drop_na(score) %>%
+  group_by(weekday) %>%
+  summarise(mean = mean(score), sd = sd(score)) %>%
+  mutate(diff = mean - sd) %>%
+  arrange(desc(diff))
+```
+
+# Modelling
+
+To fit models on large dataset this project relies on various optimization techniques that we will explore further.
+
+1. Parallel computation using FORK processes on Unix systems
+
+3. Automatic Differentiation Variational Inference to calculate approximations for posterior distributions to allow faster inference on large datasets
+4. LOO subsampling technique that allows to calculate PSIS LOO on a fraction of data samples instead of performing computation on the full dataset
+
+```{r}
+options(mc.cores = parallel::detectCores())
+```
+
+The current release of stan seems to be affected by a [memory leak in the OpenCL code](https://github.com/stan-dev/stanc3/issues/857), so this project uses latest Stan and cmdstan versions that were built directly from the github repos. To install the dev version of `cmdstanr` use the following command: `remotes::install_github("stan-dev/cmdstanr")`. Also, should compile `cmdstan` manually to include all latest bug fixes. See [this topic](https://discourse.mc-stan.org/t/how-to-install-stanc3-memory-leak-fix-for-cmdstanr/22478) if you want to run the model, otherwise you will run out of memory.
+
+As noted in https://discourse.mc-stan.org/t/stan-is-not-working-on-gpu-in-linux/21331/6 make sure to add `CXXFLAGS += -fpermissive` line to the makefile to avoid errors while compiling Stan models.
+
+```{r}
+set_cmdstan_path('/home/kdubovikov/lib/cmdstan')
+check_cmdstan_toolchain()
+```
+
+
+## Simple model
+
+First, we will use simple model that fits Negative Binomial distribution to the data. The model uses complete pooling, meaning that all observations share the same parameters. As a digression, here are a few discussions featuring Andrew Gelman about priors for Negative Binomial models:
+
+- https://groups.google.com/g/stan-users/c/_xxNlLGn2BI
+- https://groups.google.com/g/stan-users/c/8kTIm5aPpwo
+
+To fit the model for all data points we will use OpenCL. It is a framework that allows to perform likelihood computations for Stan models on GPUs so that the inference becomes highly parallelized.
+
+To compile our model with OpenCL support we use `stan_opencl` flag.
+```{r simple_model}
+simple_model <- cmdstan_model('./simple-model.stan', quiet = FALSE, cpp_options = list(stan_opencl = TRUE))
+```
+The source code of the simple model:
+```{r}
+simple_model
+```
+
+Now, let's fit the simple model using NUTS sampler. OpenCL optimizations will be applied automatically for the likelihood computation.
+```{r message=FALSE, warning=FALSE, cache=TRUE}
+data <- list(score = hn_posts$score - 1, N = length(hn_posts$score))
+
+simple_fit <- simple_model$sample(data = data, chains = 4, seed = SEED)
+```
+Let's run model diagnostics:
+
+```{r}
+simple_fit$cmdstan_diagnose()
+```
+
+```{r}
+simple_fit$summary()
+```
+
+Now, let's extract parameter draws and explore plots using `bayesplot` package:
+```{r cache=TRUE}
+simple_draws <- simple_fit$draws(variables = c('mu', 'phi'))
+```
+
+
+```{r cache=TRUE}
+mcmc_trace(simple_draws,  pars = c("mu", "phi"), n_warmup = 1000,
+                facet_args = list(nrow = 2, labeller = label_parsed))
+```
+
+Chain plots for $\phi$ show slight autocorrelation. Otherwise, everything looks good.
+
+```{r}
+mcmc_areas(as_draws_matrix(simple_draws),
+           prob = 0.8,
+           pars = c('mu', 'phi'))
+```
+We have very sharp parameter estimates because of the large dataset.
+
+### PSIS LOO
+
+Now let's compute PSIS LOO estimates. As our dataset is big, computing log likelihood inside `generated quantities` block will consume much memory. We will use `loo_subsample` function which allows to compute PSIS LOO estimate using a subsample of the dataset. The downside of this is that we will need to define log likelihood function in R. For this model, the implementation is in the `llfun_neg_binomial` function below:
+
+```{r cache=TRUE}
+llfun_neg_binomial <- function(data_i, draws, log = TRUE) {
+  dnbinom(data_i$score, mu = draws[, 'mu'], size = draws[, 'phi'], log = log)
+}
+
+simple_params <- as_draws_matrix(simple_draws)
+
+r_eff <- relative_eff(llfun_neg_binomial,
+                      log = FALSE, # relative_eff wants likelihood not log-likelihood values
+                      chain_id = rep(1:4, each = 1000),
+                      data = as.data.frame(data),
+                      draws = simple_params,
+                      cores = 25)
+
+loo_simple <- loo_subsample(llfun_neg_binomial, 
+              data = as.data.frame(data), 
+              draws = simple_params, 
+              r_eff = r_eff, 
+              observations = 5000, 
+              cores = 25)
+
+loo_simple
+```
+
+We get all $\hat{k}$ values lower than 0.5, which indicates reliable ELPD estimate. We see, that the current model has very low ELPD, which indicates that it is too simple for this dataset.
+
+## Hierarchical model
+
+Now, let's move closer to answering our question: which hours are the best to post on HN? To answer it, we will build a hierarchical model using additional information about time to bring new structure to the model. In particular, we will look how different years, weekdays and hours affect post scores.
+
+First, let's fit a hierarchical model on a subset of data to see how well it will perform:
+
+```{r compile-hmodel}
+hierarchical_model <- cmdstan_model('./hierarchical-model.stan', quiet = FALSE)
+```
+
+Model code:
+```{r print-hmodel}
+print(hierarchical_model)
+```
+
+Here, we sample random 5000 posts from 2019 and 2020 to fit the model using NUTS sampler. On this scale, working on CPUs is faster than relying on OpenCL which gives certain overhead when moving data back and forth between GPU and RAM.
+
+```{r hier-mcmc, message=FALSE, warning=FALSE, cache=TRUE}
+hn_posts_2020 <- hn_posts %>% 
+  filter(year %in% c(2020, 2019)) %>% 
+  mutate(score = score - 1) %>% 
+  sample_n(5000)
+
+prepare_dataset <- function(hn_posts) {
+  data <- list(score = hn_posts$score, 
+               N = length(hn_posts$score),
+               year = as.integer(as.factor(hn_posts$year)),
+               day = as.integer(hn_posts$weekday),
+               hour = hn_posts$hour,
+               num_years = n_distinct(hn_posts$year),
+               num_days = n_distinct(hn_posts$weekday),
+               num_hours = n_distinct(hn_posts$hour))
+  data
+}
+
+hierarchical_data <- prepare_dataset(hn_posts_2020)
+hierarchical_fit_mcmc <- hierarchical_model$sample(data = hierarchical_data, seed = SEED)
+```
+
+```{r hier-summ, cache=TRUE}
+hierarchical_summary <- hierarchical_fit_mcmc$summary()
+hierarchical_summary
+```
+
+Let's dig into the parameter visualizations
+```{r hier-draws, cache=TRUE}
+hierarchical_draws <- hierarchical_fit_mcmc$draws()
+hierarchical_draws <- as_draws_df(hierarchical_draws)
+```
+
+```{r}
+mcmc_areas(hierarchical_draws %>% 
+             select(contains("hours_mu")) %>% 
+             as.matrix,
+           prob = 0.8) + 
+  ggtitle("Hour distribution location parameter")
+```
+For the hours, there seems to be no significant difference. The distributions are very wide and noisy, suggesting that we need to use more data to get better estimates.
+
+```{r}
+mcmc_areas(hierarchical_draws %>% 
+             select(contains("year_mu")) %>% 
+             as.matrix,
+           prob = 0.8) + 
+  ggtitle("Year distribution location parameter")
+```
+There seems to be no large difference between 2019 and 2020 in terms of the scores.
+
+```{r}
+mcmc_areas(hierarchical_draws %>% 
+             select(contains("days_mu")) %>% 
+             as.matrix,
+           prob = 0.8) + 
+  ggtitle("Year distribution location parameter")
+```
+This plot suggests that Mondays, Fridays and Sundays could be a bit better, but not by a large margin.
+
+Now, let's compute the PSIS LOO estimates for this model
+```{r hier-loo, cache=TRUE}
+llfun_hierarchical <- function(data_i, draws, log = TRUE) {
+  year_mu <- glue("year_mu[{data_i$year}]")
+  year_phi <- glue("year_phi[{data_i$year}]")
+  days_mu <- glue("days_mu[{data_i$day}]")
+  days_phi <- glue("days_phi[{data_i$day}]")
+  hours_mu <- glue("hours_mu[{data_i$hour}]")
+  hours_phi <- glue("hours_phi[{data_i$hour}]")
+  
+  #print(dim(draws))
+  #print(draws[, c(year_mu, days_mu, hours_mu)])
+  mu_sum <- rowSums(
+    as.matrix(draws[, c(year_mu, days_mu, hours_mu)])
+  )
+  
+  phi_sum <- rowSums(
+    as.matrix(draws[, c(year_phi, days_phi, hours_phi)])
+  )
+  
+  dnbinom(data_i$score, mu = mu_sum, size = phi_sum, log = log)
+}
+
+hierarchical_params <- as_draws_matrix(hierarchical_draws)
+
+r_eff <- relative_eff(llfun_hierarchical,
+                      log = FALSE, # relative_eff wants likelihood not log-likelihood values
+                      chain_id = rep(1:4, each = 1000),
+                      data = as.data.frame(hierarchical_data),
+                      draws = hierarchical_params,
+                      cores = 25)
+
+loo_hierarchical <- loo_subsample(llfun_hierarchical,
+                          data = as.data.frame(hierarchical_data), 
+                          draws = hierarchical_params,
+                          r_eff = r_eff,
+                          observations = 500,
+                          cores = 25)
+```
+```{r}
+loo_hierarchical
+```
+We got much lower ELPD this time, but we need to consider two poits:
+
+1. Some of our $\hat{k}$ values are much higher this time, indicating unreliable ELPD estimate
+2. We use a small subsample of the data instead of the full dataset which makes our estimate overly optimistic
+
+## Variational inference
+
+To run the hierarchical model on full dataset we will need to use variational inference. Stan implements an anglorithm called AVDI that allows much faster model fits. However, this price comes with the accuracy penalty as we will be using posterior approximations instead of direct posterior samples compared to the MCMC NUTS sampler.
+
+```{r hier-vb, cache=TRUE}
+# re-compile the model to use OpenCL for faster computation on full data
+hierarchical_model <- cmdstan_model('./hierarchical-model.stan', 
+                                    quiet = FALSE, 
+                                    force_recompile = TRUE, 
+                                    cpp_options = list(stan_opencl = TRUE))
+
+# remove data filtering, we will look at all years now and without random subset sampling
+hn_posts_vb <- hn_posts %>% mutate(score = score - 1)
+
+hierarchical_data_vb <- prepare_dataset(hn_posts_vb)
+
+# run ADVI
+hierarchical_fit_vb <- hierarchical_model$variational(data = hierarchical_data_vb, 
+                                                      output_samples = 10000, 
+                                                      algorithm = "fullrank", 
+                                                      seed = SEED)
+```
+
+Now, let's run PSIS LOO on the variational approximation. `loo_subsample` uses special approach to compute LOO for posterior approximations. It uses `log_p` (log probability) and `log_g` (approximated log probability) parameters and a different algorithm for computing PSIS LOO over a subsample under the hood.
+
+When I was testing this function I have noticed that it executes really slow. Surprisingly, this lead to which I consider to be **the main result of this project**: a pull request to the `loo` package that removes computational bottleneck inside `loo_subsample` to allow much faster parallel computation of the log likelihood. You can see the changes that I have suggested here: https://github.com/stan-dev/loo/pull/171.
+
+```{r hier-vb-draws}
+hierarchical_draws_vb <- hierarchical_fit_vb$draws()
+hierarchical_draws_vb <- as_draws_df(hierarchical_draws_vb)
+```
+
+```{r hier-vb-loo, cache=TRUE}
+log_p <- hierarchical_fit_vb$lp()
+log_g <- hierarchical_fit_vb$lp_approx()
+
+hierarchical_params_vb <- as_draws_matrix(hierarchical_draws_vb)
+
+loo_hierarchical_vb <- loo_subsample(llfun_hierarchical,
+                          data = as.data.frame(hierarchical_data_vb), 
+                          draws = hierarchical_params_vb, 
+                          log_p = log_p,
+                          log_g = log_g,
+                          observations = 3000 ,
+                          cores = 25)
+loo_hierarchical_vb
+```
+The ELPD estimate we got is roughy equivalent to the ELPD of the simple model. Unfortunately, all of the $\hat{k}$ values are larger than 1, which indicates that the PSIS LOO estimate is unreliable. Variational approximations tend to be fast, but inaccurate. Let's explore parameter plots to see how they've changed when model is using the full dataset.
+
+```{r}
+mcmc_areas(hierarchical_draws_vb %>% 
+             select(contains("year_mu")) %>% 
+             as.matrix,
+           prob = 0.8) + 
+  ggtitle("Year distribution location parameter")
+```
+From this plot we see, that if the model is correct, years do not affect score distribution significantly, apart from one year, which has a lower estimate.
+
+```{r}
+mcmc_areas(hierarchical_draws_vb %>% 
+             select(contains("days_mu")) %>% 
+             as.matrix,
+           prob = 0.8) + 
+  ggtitle("Year distribution location parameter")
+```
+Here, we see that midweek distributions have slightly lower estimates. Tuesday seems to be a good day to post.
+
+```{r}
+mcmc_areas(hierarchical_draws_vb %>% 
+             select(contains("hours_mu")) %>% 
+             as.matrix,
+           prob = 0.8) + 
+  ggtitle("Hour distribution location parameter")
+```
+As in the previous models, posting in daytime indicates better response than posting at night or early mornings.
+
+# Conclusion
+
+## Technical part
+In this project, we have looked at how to run Stan models on large datasets. Tools that the Stan ecosystem provides for this are:
+
+1. OpenCL support which allows to run likelihood computations on GPUs
+2. LOO subsampling that allows to scale PSIS LOO on large datasets using parallel computation over likelihood functions defined in R
+3. Variational inference support that allows for much faster but less accurate posterior approximations
+
+As a result of this project I suggested an improvement for the `loo` package that you can see here: https://github.com/stan-dev/loo/pull/171.
+
+## Modelling part
+
+We have looked over 3 models:
+
+1. Simple Negative binomial model that was fit on the full dataset using NUTS
+2. Hierarchical model that included time-related information that was fit on the small subsample of the dataset using NUTS
+3. Hierarchical model that included time-related information that was fit on the full dataset using ADVI
+
+Models suggest that the best time to post on HackerNews is during daytime on Mondays, Fridays and Saturdays, but all models clearly need an improvement and additional data to give more reliable parameter estimates.
+
+## Further directions
+
+This project is fairly technically focused because I spent a lot of time working with the `loo` package source code instead of modelling, so there is a lot left on the modelling side:
+
+1. Explore mixture models to improve model quality
+2. Add additional features to the model. I have a code that does topic modeling over this dataset which can be used to generate additional features that should improve resulting metrics
+3. Prior analysis. This should not be as significant since we have a lot of data and low prior sensitivity as a result
